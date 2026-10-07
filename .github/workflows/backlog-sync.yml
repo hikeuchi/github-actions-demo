@@ -1,0 +1,130 @@
+name: Sync Backlog status
+
+on:
+  pull_request:
+    types: [opened, closed]
+
+permissions: {}
+
+jobs:
+  backlog-sync:
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'opened' ||
+       (github.event.action == 'closed' && github.event.pull_request.merged == true))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Update Backlog issues
+        env:
+          BACKLOG_API_KEY: ${{ secrets.BACKLOG_API_KEY }}
+          BACKLOG_ENDPOINT: https://morisawa.backlog.jp/api/v2/
+          PROJECT_KEY: FONTELIER_V2
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import http.client
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          def main():
+              try:
+                  with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+                      event = json.load(event_file)
+              except (KeyError, OSError, ValueError):
+                  print("Cannot read the GitHub event payload.", file=sys.stderr)
+                  return 1
+
+              if not isinstance(event, dict):
+                  print("Invalid GitHub event payload.", file=sys.stderr)
+                  return 1
+              pull_request = event.get("pull_request")
+              if not isinstance(pull_request, dict):
+                  print("Invalid pull request payload.", file=sys.stderr)
+                  return 1
+              action = event.get("action")
+              if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+                  print("Skipping an unsupported event.")
+                  return 0
+              if action == "opened":
+                  status_id = 2
+              elif action == "closed" and pull_request.get("merged") is True:
+                  status_id = 3
+              else:
+                  print("Skipping a pull request that was not opened or merged.")
+                  return 0
+
+              api_key = os.environ.get("BACKLOG_API_KEY", "")
+              endpoint = os.environ.get("BACKLOG_ENDPOINT", "")
+              project_key = os.environ.get("PROJECT_KEY", "")
+              if not api_key.strip() or not endpoint.strip() or not project_key.strip():
+                  print(
+                      "BACKLOG_API_KEY, BACKLOG_ENDPOINT and PROJECT_KEY must be configured.",
+                      file=sys.stderr,
+                  )
+                  return 1
+              try:
+                  parsed = urllib.parse.urlsplit(endpoint)
+                  parsed.port
+                  valid_endpoint = (
+                      parsed.scheme == "https"
+                      and bool(parsed.hostname)
+                      and parsed.username is None
+                      and parsed.password is None
+                      and parsed.path in ("/api/v2", "/api/v2/")
+                      and "?" not in endpoint
+                      and "#" not in endpoint
+                      and not any(character.isspace() or ord(character) < 32 for character in endpoint)
+                  )
+              except ValueError:
+                  valid_endpoint = False
+              if not valid_endpoint:
+                  print(
+                      "BACKLOG_ENDPOINT must be an HTTPS URL with a host and /api/v2/ path, "
+                      "without credentials, a query or a fragment.",
+                      file=sys.stderr,
+                  )
+                  return 1
+
+              title = pull_request.get("title") or ""
+              body = pull_request.get("body") or ""
+              if not isinstance(title, str) or not isinstance(body, str):
+                  print("Invalid pull request title or body.", file=sys.stderr)
+                  return 1
+              pattern = r"(?<![A-Za-z0-9_])" + re.escape(project_key) + r"-[0-9]+(?![A-Za-z0-9_])"
+              issue_keys = list(dict.fromkeys(re.findall(pattern, title + "\n" + body)))
+              if not issue_keys:
+                  print("No Backlog issue keys found; nothing to update.")
+                  return 0
+
+              data = urllib.parse.urlencode({"statusId": status_id}).encode("utf-8")
+              query = urllib.parse.urlencode({"apiKey": api_key})
+              failed = False
+              for issue_key in issue_keys:
+                  url = endpoint.rstrip("/") + "/issues/" + urllib.parse.quote(issue_key, safe="") + "?" + query
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=data,
+                          headers={"Content-Type": "application/x-www-form-urlencoded"},
+                          method="PATCH",
+                      )
+                      with urllib.request.urlopen(request, timeout=30):
+                          pass
+                  except urllib.error.HTTPError as error:
+                      print(f"{issue_key}: HTTP {error.code}", file=sys.stderr)
+                      failed = True
+                  except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError):
+                      print(f"{issue_key}: Backlog request failed.", file=sys.stderr)
+                      failed = True
+                  else:
+                      print(f"{issue_key}: updated statusId={status_id}.")
+              return 1 if failed else 0
+
+          sys.exit(main())
+          PY
